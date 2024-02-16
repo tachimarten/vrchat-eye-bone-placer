@@ -7,7 +7,9 @@ use argmin::{
     solver::simulatedannealing::{Anneal, SATempFunc, SimulatedAnnealing},
 };
 use eframe::{App, Frame};
-use egui::{Button, CentralPanel, Context as EguiContext};
+use egui::{
+    text::LayoutJob, Button, CentralPanel, Color32, Context as EguiContext, FontId, TextFormat,
+};
 use futures::Future;
 use glam::Vec3A;
 use obj::ObjData;
@@ -19,6 +21,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 const INITIAL_TEMPERATURE: f32 = 100.0;
 const MAX_SCALE: f32 = 10.0;
 const CHANGE_SCALE: f32 = 1.0;
+const INSIDE_PENALTY: f32 = 2.0;
 
 #[cfg(debug_assertions)]
 const STALL_BEST: u64 = 100_000;
@@ -26,9 +29,9 @@ const STALL_BEST: u64 = 100_000;
 const REANNEALING_BEST: u64 = 3_000;
 
 #[cfg(not(debug_assertions))]
-const STALL_BEST: u64 = 1_000_000;
+const STALL_BEST: u64 = 500_000;
 #[cfg(not(debug_assertions))]
-const REANNEALING_BEST: u64 = 30_000;
+const REANNEALING_BEST: u64 = 15_000;
 
 struct EyeBonePlacerApp {
     obj: Option<ObjData>,
@@ -91,6 +94,75 @@ impl App for EyeBonePlacerApp {
             if let Ok(obj) = self.obj_rx.try_recv() {
                 self.obj = Some(obj);
             }
+
+            ui.heading("VRChat Eye Bone Placer");
+
+            let mut help_text = LayoutJob::default();
+            help_text.append(
+                "VRChat assumes that eyeballs are spheres. But sometimes they aren't. \
+This is where this tool comes in.\n\n",
+                0.0,
+                TextFormat::default(),
+            );
+            help_text.append(
+                "To have a non-spherical eye in VRChat, make the eyeball a static \
+sphere, and attach the iris to a bone. This bone needs to be placed in such a way that it glides \
+over the eyeball as close as possible without going inside. Placing this is a pain, so this tool \
+automates it.\n\n",
+                0.0,
+                TextFormat::default(),
+            );
+            help_text.append("Choose a mesh in ", 0.0, TextFormat::default());
+            help_text.append(
+                ".obj",
+                0.0,
+                TextFormat::simple(FontId::monospace(12.0), Color32::LIGHT_GRAY),
+            );
+            help_text.append(" format containing the ", 0.0, TextFormat::default());
+            help_text.append(
+                "visible part",
+                0.0,
+                TextFormat::simple(FontId::proportional(14.0), Color32::RED),
+            );
+            help_text.append(" of ", 0.0, TextFormat::default());
+            help_text.append(
+                "one",
+                0.0,
+                TextFormat::simple(FontId::proportional(14.0), Color32::RED),
+            );
+            help_text.append(
+                " eyeball, and this tool will tell you where to place the bone. \
+This only places one bone, so make sure to only supply a single eyeball. You may mirror the bone \
+in your modeling software to produce the other one. Also, it helps if you delete parts of the \
+mesh that aren't visible, so that they aren't included in the approximation. Finally, remember \
+that Blender switches the Y and Z axes whenever exporting in ",
+                0.0,
+                TextFormat::default(),
+            );
+            help_text.append(
+                ".obj",
+                0.0,
+                TextFormat::simple(FontId::monospace(12.0), Color32::LIGHT_GRAY),
+            );
+            help_text.append(
+                " format, so you may have to switch them back when entering the result in \
+Blender.\n\n",
+                0.0,
+                TextFormat::default(),
+            );
+            help_text.append(
+                "This is essentially just approximating the surface of whatever you \
+provide with a sphere.\n\n",
+                0.0,
+                TextFormat::default(),
+            );
+            help_text.append(
+                "Note that it may take a few seconds to place the bone when you click \
+\"Place Eye Bone\". This is normal.",
+                0.0,
+                TextFormat::default(),
+            );
+            ui.label(help_text);
 
             if ui.button("Load .obj…").clicked() {
                 let obj_tx = self.obj_tx.clone();
@@ -234,7 +306,13 @@ impl CostFunction for Problem {
             .positions
             .iter()
             .map(|&p| {
-                let dist = (p - sphere.center).length() - sphere.radius;
+                let mut dist = (p - sphere.center).length() - sphere.radius;
+
+                // Try not to go inside the eyeball…
+                if dist < 0.0 {
+                    dist *= INSIDE_PENALTY;
+                }
+
                 dist * dist
             })
             .sum())
