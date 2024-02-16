@@ -3,25 +3,30 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use argmin::{
-    core::{CostFunction, Error, Executor},
+    core::{CostFunction, Error, IterState, Problem, Solver, State, TerminationStatus},
     solver::simulatedannealing::{Anneal, SATempFunc, SimulatedAnnealing},
 };
 use eframe::{App, Frame};
-use egui::{
-    text::LayoutJob, Button, CentralPanel, Color32, Context as EguiContext, FontId, TextFormat,
-};
+use egui::{vec2, Align, Button, CentralPanel, Context as EguiContext, DragValue, Layout};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use futures::Future;
 use glam::Vec3A;
+use instant::{Duration, Instant};
 use obj::ObjData;
 use rand::distributions::{Distribution, Uniform};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::{
+    mem,
+    sync::mpsc::{self, Receiver, Sender},
+};
 
 const INITIAL_TEMPERATURE: f32 = 100.0;
 const MAX_SCALE: f32 = 10.0;
 const CHANGE_SCALE: f32 = 1.0;
 const INSIDE_PENALTY: f32 = 2.0;
+const TIME_SLICE: Duration = Duration::from_millis(1000 / 10);
 
 #[cfg(debug_assertions)]
 const STALL_BEST: u64 = 100_000;
@@ -38,15 +43,30 @@ struct EyeBonePlacerApp {
     result_str: String,
     obj_tx: Sender<ObjData>,
     obj_rx: Receiver<ObjData>,
+    stall_best: u64,
+    reannealing_best: u64,
+    solver_state: EyeBoneSolverState,
+    commonmark_cache: CommonMarkCache,
+}
+
+enum EyeBoneSolverState {
+    Idle,
+    Solved(Sphere),
+    Solving {
+        problem: Problem<EyeBonePlacementProblem>,
+        solver: SimulatedAnnealing<f32, Xoshiro256PlusPlus>,
+        iter_state: IterState<Sphere, (), (), (), f32>,
+    },
+    Failed(String),
 }
 
 #[derive(Debug)]
-struct Problem {
+struct EyeBonePlacementProblem {
     positions: Vec<Vec3A>,
     aabb: (Vec3A, Vec3A),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Sphere {
     center: Vec3A,
     radius: f32,
@@ -95,90 +115,33 @@ impl App for EyeBonePlacerApp {
                 self.obj = Some(obj);
             }
 
-            ui.heading("VRChat Eye Bone Placer");
+            CommonMarkViewer::new("help").show(
+                ui,
+                &mut self.commonmark_cache,
+                include_str!("../README.md"),
+            );
 
-            let mut help_text = LayoutJob::default();
-            help_text.append(
-                "VRChat assumes that eyeballs are spheres. But sometimes they aren't. \
-This is where this tool comes in.\n\n",
-                0.0,
-                TextFormat::default(),
-            );
-            help_text.append(
-                "To have a non-spherical eye in VRChat, make the eyeball a static \
-sphere, and attach the iris to a bone. This bone needs to be placed in such a way that it glides \
-over the eyeball as close as possible without going inside. Placing this is a pain, so this tool \
-automates it.\n\n",
-                0.0,
-                TextFormat::default(),
-            );
-            help_text.append("Choose a mesh in ", 0.0, TextFormat::default());
-            help_text.append(
-                ".obj",
-                0.0,
-                TextFormat::simple(FontId::monospace(12.0), Color32::LIGHT_GRAY),
-            );
-            help_text.append(" format containing the ", 0.0, TextFormat::default());
-            help_text.append(
-                "visible part",
-                0.0,
-                TextFormat::simple(FontId::proportional(14.0), Color32::RED),
-            );
-            help_text.append(" of ", 0.0, TextFormat::default());
-            help_text.append(
-                "one",
-                0.0,
-                TextFormat::simple(FontId::proportional(14.0), Color32::RED),
-            );
-            help_text.append(
-                " eyeball, and this tool will tell you where to place the bone. \
-This only places one bone, so make sure to only supply a single eyeball. You may mirror the bone \
-in your modeling software to produce the other one. Also, it helps if you delete parts of the \
-mesh that aren't visible, so that they aren't included in the approximation. Finally, remember \
-that Blender switches the Y and Z axes whenever exporting in ",
-                0.0,
-                TextFormat::default(),
-            );
-            help_text.append(
-                ".obj",
-                0.0,
-                TextFormat::simple(FontId::monospace(12.0), Color32::LIGHT_GRAY),
-            );
-            help_text.append(
-                " format, so you may have to switch them back when entering the result in \
-Blender.\n\n",
-                0.0,
-                TextFormat::default(),
-            );
-            help_text.append(
-                "This is essentially just approximating the surface of whatever you \
-provide with a sphere.\n\n",
-                0.0,
-                TextFormat::default(),
-            );
-            help_text.append(
-                "Note that it may take a few seconds to place the bone when you click \
-\"Place Eye Bone\". This is normal.",
-                0.0,
-                TextFormat::default(),
-            );
-            ui.label(help_text);
-
-            if ui.button("Load .obj…").clicked() {
-                let obj_tx = self.obj_tx.clone();
-                let task = AsyncFileDialog::new()
-                    .add_filter("obj files", &["obj"])
-                    .set_title("VRChat Eye Bone Placer")
-                    .pick_file();
-                execute(async move {
-                    if let Some(file) = task.await {
-                        let obj_data = file.read().await;
-                        if let Ok(obj_data) = ObjData::load_buf(&*obj_data) {
-                            let _ = obj_tx.send(obj_data);
-                        }
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 0.0),
+                Layout::left_to_right(Align::Center).with_main_justify(true),
+                |ui| {
+                    if ui.button("Load .obj…").clicked() {
+                        let obj_tx = self.obj_tx.clone();
+                        let task = AsyncFileDialog::new()
+                            .add_filter("obj files", &["obj"])
+                            .set_title("VRChat Eye Bone Placer")
+                            .pick_file();
+                        execute(async move {
+                            if let Some(file) = task.await {
+                                let obj_data = file.read().await;
+                                if let Ok(obj_data) = ObjData::load_buf(&*obj_data) {
+                                    let _ = obj_tx.send(obj_data);
+                                }
+                            }
+                        });
                     }
-                });
-            }
+                },
+            );
 
             match self.obj {
                 None => {
@@ -197,11 +160,59 @@ provide with a sphere.\n\n",
                 }
             }
 
-            if ui
-                .add_enabled(self.obj.is_some(), Button::new("Place Eye Bone"))
-                .clicked()
-            {
-                self.place_eye_bone();
+            ui.collapsing("Advanced", |ui| {
+                ui.label(
+                    "The following fields can be used to adjust how long the approximation runs \
+for. Higher values mean a potentially-better approximation but a longer run time.",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Stop after no progress is made after ");
+                    ui.add(DragValue::new(&mut self.stall_best).speed(1000.0));
+                    ui.label(" iterations");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Retry if no progress is made after ");
+                    ui.add(DragValue::new(&mut self.reannealing_best).speed(100.0));
+                    ui.label(" iterations");
+                });
+            });
+
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 0.0),
+                Layout::left_to_right(Align::Center).with_main_justify(true),
+                |ui| {
+                    if ui
+                        .add_enabled(
+                            self.obj.is_some()
+                                && !matches!(self.solver_state, EyeBoneSolverState::Solving { .. }),
+                            Button::new("Place Eye Bone"),
+                        )
+                        .clicked()
+                    {
+                        self.init_eye_bone_placer();
+                    }
+                },
+            );
+
+            self.solver_state.tick();
+
+            match self.solver_state {
+                EyeBoneSolverState::Idle => {}
+                EyeBoneSolverState::Solving { ref iter_state, .. } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Solving, iteration {}…", iter_state.iter));
+                    });
+                }
+                EyeBoneSolverState::Solved(ref sphere) => {
+                    ui.label(format!(
+                        "Success: Place the eye bone at ({}, {}, {}) and give it length {}.",
+                        sphere.center.x, sphere.center.y, sphere.center.z, sphere.radius
+                    ));
+                }
+                EyeBoneSolverState::Failed(ref msg) => {
+                    ui.label(msg);
+                }
             }
 
             ui.label(&self.result_str);
@@ -210,7 +221,7 @@ provide with a sphere.\n\n",
 }
 
 impl EyeBonePlacerApp {
-    fn place_eye_bone(&mut self) {
+    fn init_eye_bone_placer(&mut self) {
         let positions: Vec<_> = self
             .obj
             .as_ref()
@@ -227,39 +238,92 @@ impl EyeBonePlacerApp {
                 (acc.0.min(elem), acc.1.max(elem))
             });
 
-        let problem = Problem { positions, aabb };
-
-        let solver = SimulatedAnnealing::new(INITIAL_TEMPERATURE)
+        let mut problem = Problem::new(EyeBonePlacementProblem { positions, aabb });
+        let mut solver = SimulatedAnnealing::new(INITIAL_TEMPERATURE)
             .unwrap()
             .with_temp_func(SATempFunc::Boltzmann)
-            .with_stall_best(STALL_BEST)
-            .with_reannealing_best(REANNEALING_BEST);
+            .with_stall_best(self.stall_best)
+            .with_reannealing_best(self.reannealing_best);
 
-        let result = Executor::new(problem, solver)
-            .configure(|anneal| {
-                anneal.param(Sphere {
-                    center: (aabb.0 + aabb.1) * 0.5,
-                    radius: (aabb.1 - aabb.0).length() * 0.5,
-                })
-            })
-            .run()
-            .unwrap();
+        let mut state = IterState::new();
+        state = state.param(Sphere {
+            center: (aabb.0 + aabb.1) * 0.5,
+            radius: (aabb.1 - aabb.0).length() * 0.5,
+        });
+        let (iter_state, _) = solver
+            .init(&mut problem, state)
+            .expect("Failed to initialize solver");
 
-        match result.state().best_param {
-            Some(ref sphere) => {
-                self.result_str = format!(
-                    "Success: Place the eye bone at ({}, {}, {}) and give it length {}.",
-                    sphere.center.x, sphere.center.y, sphere.center.z, sphere.radius
-                );
+        self.solver_state = EyeBoneSolverState::Solving {
+            problem,
+            solver,
+            iter_state,
+        };
+    }
+}
+
+impl EyeBoneSolverState {
+    fn tick(&mut self) {
+        let EyeBoneSolverState::Solving {
+            ref mut problem,
+            ref mut solver,
+            ref mut iter_state,
+        } = *self
+        else {
+            return;
+        };
+
+        let start_time = Instant::now();
+
+        while (Instant::now() - start_time) < TIME_SLICE && !iter_state.terminated() {
+            match <SimulatedAnnealing<_, _> as Solver<
+                EyeBonePlacementProblem,
+                IterState<_, _, _, _, _>,
+            >>::terminate_internal(solver, iter_state)
+            {
+                TerminationStatus::Terminated(why) => {
+                    *iter_state = mem::take(iter_state).terminate_with(why)
+                }
+                TerminationStatus::NotTerminated => {}
             }
-            None => {
-                self.result_str = format!("Failed to place eye bone: {:?}", result.state);
+            if iter_state.terminated() {
+                break;
             }
+
+            let Ok((new_iter_state, _)) = solver.next_iter(problem, mem::take(iter_state)) else {
+                *self = EyeBoneSolverState::Failed(self.error_msg());
+                return;
+            };
+
+            *iter_state = new_iter_state;
+            if iter_state.terminated() {
+                break;
+            }
+
+            iter_state.update();
+            iter_state.increment_iter();
+        }
+
+        if !iter_state.terminated() {
+            return;
+        }
+
+        match iter_state.best_param {
+            Some(ref sphere) => *self = EyeBoneSolverState::Solved(sphere.clone()),
+            None => *self = EyeBoneSolverState::Failed(self.error_msg()),
+        }
+    }
+
+    fn error_msg(&self) -> String {
+        if let EyeBoneSolverState::Solving { ref iter_state, .. } = *self {
+            format!("Failed to place eye bone: {:?}", iter_state)
+        } else {
+            String::new()
         }
     }
 }
 
-impl Anneal for Problem {
+impl Anneal for EyeBonePlacementProblem {
     type Param = Sphere;
 
     type Output = Sphere;
@@ -295,7 +359,7 @@ impl Anneal for Problem {
     }
 }
 
-impl CostFunction for Problem {
+impl CostFunction for EyeBonePlacementProblem {
     type Param = Sphere;
 
     type Output = f32;
@@ -327,6 +391,10 @@ impl Default for EyeBonePlacerApp {
             result_str: Default::default(),
             obj_tx,
             obj_rx,
+            solver_state: EyeBoneSolverState::Idle,
+            stall_best: STALL_BEST,
+            reannealing_best: REANNEALING_BEST,
+            commonmark_cache: CommonMarkCache::default(),
         }
     }
 }

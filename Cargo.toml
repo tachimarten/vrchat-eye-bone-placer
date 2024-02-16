@@ -9,11 +9,13 @@ edition = "2021"
 argmin = "0.9"
 eframe = "0.26"
 egui = "0.26"
+egui_commonmark = "0.12"
 futures = "0.3"
 log = "0.4"
 obj = "0.10"
 pretty_env_logger = "0.5"
 rand = "0.8"
+rand_xoshiro = "0.6"
 rfd = "0.13"
 
 [dependencies.getrandom]
