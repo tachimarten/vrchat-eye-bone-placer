@@ -1,0 +1,36 @@
+[package]
+name = "vrchat-eye-bone-placer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+argmin = "0.9"
+eframe = "0.26"
+egui = "0.26"
+futures = "0.3"
+log = "0.4"
+obj = "0.10"
+pretty_env_logger = "0.5"
+rand = "0.8"
+rfd = "0.13"
+
+[dependencies.getrandom]
+version = "0.2"
+features = ["js"]
+
+[dependencies.glam]
+version = "0.25"
+features = ["serde"]
+
+[dependencies.instant]
+version = "0.1"
+features = ["wasm-bindgen"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
